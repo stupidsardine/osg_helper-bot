@@ -1,0 +1,22 @@
+<<<<<<< Updated upstream
+=======
+<<<<<<< Updated upstream
+=======
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+
+# OS files
+.DS_Store
+
+# Sensitive info
+.env
+ gsa.json
+ .env
+>>>>>>> Stashed changes
+ gsa.json
+ .env
+>>>>>>> Stashed changes
