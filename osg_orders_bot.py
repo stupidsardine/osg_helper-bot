@@ -27,6 +27,20 @@ from telegram.ext import (
 from datetime import datetime, timedelta
 
 from datetime import datetime, timedelta
+# --- Функция для распознавания разных форматов даты ---
+def parse_date(date_str):
+    """Пытается понять дату в разных форматах"""
+    if not date_str:
+        return None
+    if isinstance(date_str, datetime):
+        return date_str
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%Y.%m.%d"):
+        try:
+            return datetime.strptime(date_str.strip(), fmt)
+        except Exception:
+            continue
+    return None
+
 
 # --- Параметры расчёта ОСС ---
 SHELF_LIFE_DAYS = 360          # общий срок годности, дней
@@ -65,62 +79,80 @@ logger = logging.getLogger("osg-bot")
 ORDERS_CACHE: Dict[str, str] = {}
 
 
-# -------------------- Google Sheets ----------------
-def load_orders_from_sheet() -> Dict[str, str]:
-    """
-    Возвращает словарь {OrderNo: DeliveryDate}.
-    Делает аккуратные проверки: выбирает лист по названию (или первый, если не нашли),
-    обрезает пробелы в заголовках и данных и даёт понятные ошибки.
-    """
-    if not GOOGLE_SHEET_ID:
-        raise RuntimeError("GOOGLE_SHEET_ID не задан")
+from gspread.exceptions import WorksheetNotFound, APIError
 
-    if not os.path.exists(GOOGLE_CREDS_PATH):
-        raise RuntimeError(
-            f"Файл кредов не найден: {GOOGLE_CREDS_PATH}. "
-            f"Проверь GOOGLE_APPLICATION_CREDENTIALS или путь в коде."
-        )
+SHEET_TITLE = "Orders"        # ожидаемое имя листа (вкладки)
+HEADER_ORDER = "OrderNo"
+HEADER_DATE  = "DeliveryDate"
 
-    client = gspread.service_account(filename=GOOGLE_CREDS_PATH)
-    sh = client.open_by_key(GOOGLE_SHEET_ID)
+def _connect_sheet():
+    """Подключение к книге по ID. Бросает понятную ошибку при проблеме доступа/ID."""
+    import gspread
+    from google.oauth2.service_account import Credentials
 
-    # список листов для диагностики
-    titles = [ws.title for ws in sh.worksheets()]
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+    creds = Credentials.from_service_account_file(GOOGLE_CREDS_PATH, scopes=scopes)
+    client = gspread.authorize(creds)
 
-    # пробуем ровно по названию, иначе — первый лист
     try:
-        ws = sh.worksheet(SHEET_TITLE.strip())
+        sh = client.open_by_key(GOOGLE_SHEET_ID)
+    except APIError as e:
+        code = getattr(e.response, "status_code", None)
+        raise RuntimeError(
+            f"Google API: не удалось открыть книгу по ID ({GOOGLE_SHEET_ID}). "
+            f"Статус: {code or 'unknown'}."
+        ) from e
+
+    return client, sh
+
+
+def load_orders_from_sheet() -> dict[str, str]:
+    """
+    Загружает словарь {order_no: delivery_date_str}.
+    Пытается взять лист 'Orders', если нет — берёт первый лист и предупреждает.
+    Бросает RuntimeError с понятным текстом вместо голого [404].
+    """
+    global ORDERS_CACHE
+    client, sh = _connect_sheet()
+
+    # пробуем целевой лист
+    try:
+        ws = sh.worksheet(SHEET_TITLE)
+        used_sheet = SHEET_TITLE
     except WorksheetNotFound:
-        ws = sh.sheet1
+        # fallback — первый лист
+        ws = sh.get_worksheet(0)
+        used_sheet = ws.title
 
-    header = [c.strip() for c in ws.row_values(1)]
     try:
-        col_order = header.index("OrderNo") + 1
-        col_date = header.index("DeliveryDate") + 1
-    except ValueError:
+        rows = ws.get_all_records()
+    except APIError as e:
+        code = getattr(e.response, "status_code", None)
         raise RuntimeError(
-            f"Не найдены заголовки 'OrderNo'/'DeliveryDate'. Найдено: {header}. "
-            f"Листы книги: {titles}. Активный лист: {ws.title}"
+            f"Google API: не удалось прочитать лист '{used_sheet}'. Статус: {code or 'unknown'}."
+        ) from e
+
+    if not rows:
+        raise RuntimeError(
+            f"Лист '{used_sheet}' пустой или нет заголовков '{HEADER_ORDER}'/'{HEADER_DATE}'."
         )
 
-    data: List[List[str]] = ws.get_all_values()
-    result: Dict[str, str] = {}
-    for row in data[1:]:
-        if len(row) < max(col_order, col_date):
+    data: dict[str, str] = {}
+    for r in rows:
+        order_no = str(r.get(HEADER_ORDER, "")).strip()
+        delivery  = str(r.get(HEADER_DATE, "")).strip()
+        if not order_no:
             continue
-        order_no = row[col_order - 1].strip()
-        delivery_date = row[col_date - 1].strip()
-        if order_no:
-            result[order_no] = delivery_date
 
-    if not result:
-        raise RuntimeError(
-            f"Данных не найдено. Проверь, что под заголовками есть строки. "
-            f"Лист: {ws.title}, заголовки: {header}"
-        )
+        # приводим дату к человекочитаемой, если возможно
+        dt = parse_date(delivery)
+        data[order_no] = dt.strftime("%d.%m.%Y") if dt else delivery
 
-    return result
-
+    ORDERS_CACHE = data
+    return ORDERS_CACHE, used_sheet
 
 # -------------------- Хэндлеры ---------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -169,16 +201,17 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reload_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Перечитать таблицу и обновить кэш."""
-    global ORDERS_CACHE
     try:
-        ORDERS_CACHE = load_orders_from_sheet()
-        await update.message.reply_text(
-            f"✅ Загружено {len(ORDERS_CACHE)} заказов из Google Sheets."
-        )
+        (cache, used_sheet) = load_orders_from_sheet()
+        n = len(cache)
+        extra = "" if used_sheet == SHEET_TITLE else f"\n⚠️ Лист '{SHEET_TITLE}' не найден. Использован лист: '{used_sheet}'."
+        await update.message.reply_text(f"✅ Загружено {n} заказов из Google Sheets.{extra}")
+    except RuntimeError as e:
+        await update.message.reply_text(f"⚠️ Ошибка при загрузке: {e}")
     except Exception as e:
-        logger.exception("Ошибка при загрузке данных")
-        await update.message.reply_text(f"⚠️ Ошибка при загрузке данных: {e}")
+        # на всякий случай ловим всё остальное
+        await update.message.reply_text(f"⚠️ Непредвиденная ошибка: {e}")
+
 
 
 def _orders_keyboard() -> InlineKeyboardMarkup:
@@ -234,17 +267,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # 3) Считаем минимальную дату розлива под требуемый ОСС
-    min_prod = min_production_date_for_osg(delivery_dt)
+delivery_dt = parse_date(delivery_str)
 
-    # 4) Отвечаем
-    reply = (
-        f"📦 Заказ: {order_no}\n"
-        f"📅 Дата доставки: {delivery_dt.strftime('%d.%m.%Y')}\n"
-        f"🎯 Требуемый ОСГ: ≥ {TARGET_OSG_PERCENT}%\n"
-        f"🏭 Производство — не раньше: {min_prod.strftime('%d.%m.%Y')}\n"
-        f"ℹ️ Параметры: СГ={SHELF_LIFE_DAYS} дней, буфер={SAFETY_BUFFER_DAYS} дн."
+if delivery_dt is None:
+    await query.edit_message_text(
+        f"📦 Заказ: {order_no}\n⚠️ Не удалось распознать дату доставки: {delivery_str}"
     )
-    await query.edit_message_text(reply)
+    return
+
+min_prod = min_production_date_for_osg(delivery_dt)
+
+# 4) Отвечаем
+reply = (
+    f"📦 Заказ: {order_no}\n"
+    f"📅 Дата доставки: {delivery_dt.strftime('%d.%m.%Y')}\n"
+    f"💧 Требуемый ОСС: ≥ {TARGET_OSG_PERCENT}%\n"
+    f"🏭 Производство — не раньше: {min_prod.strftime('%d.%m.%Y')}\n"
+    f"📊 Параметры: СГ={SHELF_LIFE_DAYS} дней, буфер={SAFETY_BUFFER_DAYS} дн."
+)
+await query.edit_message_text(reply)
 
 
 
