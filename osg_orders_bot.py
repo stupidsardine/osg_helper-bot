@@ -1,305 +1,255 @@
 # -*- coding: utf-8 -*-
 """
-OSG Orders Bot
-python-telegram-bot == 21.x
-gspread + Google Service Account
+OSG Orders Bot — v21+ (python-telegram-bot)
+Google Sheets (gspread + сервисный аккаунт)
 
-Команды:
-  /start  /help   – приветствие и инструкция
-  /reload        – перечитать книгу и обновить кэш заказов
-  /orders        – показать кнопки с номерами заказов
-  /debug         – диагностика подключения к Google Sheets
+ENV/настройки (варианты):
+- В .env/переменных окружения (рекомендуется)
+    TELEGRAM_BOT_TOKEN=xxx:yyyy
+    GOOGLE_SHEET_ID=1A2B3C... (ID таблицы в URL)
+    GOOGLE_APPLICATION_CREDENTIALS=./gsa.json  (путь к ключу сервисного аккаунта)
+- Либо задай константы ниже (fallback).
 """
 
 import os
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta
 
 import gspread
 from gspread.exceptions import WorksheetNotFound
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
 )
-from datetime import datetime, timedelta
 
-from datetime import datetime, timedelta
-# --- Функция для распознавания разных форматов даты ---
-def parse_date(date_str):
-    """Пытается понять дату в разных форматах"""
+# -------------------- ЛОГИРОВАНИЕ --------------------
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,  # хочешь больше подробностей — DEBUG
+)
+logger = logging.getLogger("osg-bot")
+logger.setLevel(logging.DEBUG)
+
+# -------------------- НАСТРОЙКИ ----------------------
+TELEGRAM_BOT_TOKEN = "8462456972:AAHBUSVkSYEsJWmexYBoK-gLcTbsdj1LLXo"
+GOOGLE_SHEET_ID = "1O1LQ0y9IC4k4sp6_q5Uq5E8hABVLkh_29txBaygULdA"
+GOOGLE_CREDS_PATH = r"C:\Users\Алексей\Desktop\osg-helper-bot\gsa.json"
+ORDERS_SHEET_NAME = "Orders"
+
+
+
+# Параметры расчёта (можно вынести в ENV при желании)
+SHELF_LIFE_DAYS = int(os.getenv("SHELF_LIFE_DAYS", "360"))      # срок годности (дней)
+TARGET_OSG_PERCENT = int(os.getenv("TARGET_OSG_PERCENT", "82")) # целевой ОСС (в %)
+SAFETY_BUFFER_DAYS = int(os.getenv("SAFETY_BUFFER_DAYS", "2"))  # технологический буфер
+
+# Какая вкладка в книге
+ORDERS_SHEET_NAME = os.getenv("ORDERS_SHEET_NAME", "Orders").strip()
+
+# Кэш заказов: {order_no: "dd.mm.yyyy"}
+ORDERS_CACHE: Dict[str, str] = {}
+
+# -------------------- УТИЛИТЫ ------------------------
+def parse_date(date_str: str) -> Optional[datetime]:
+    """Пытается распознать текстовую дату в нескольких форматах."""
     if not date_str:
         return None
-    if isinstance(date_str, datetime):
-        return date_str
-    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%Y.%m.%d"):
+
+    # Терпимо относимся к «пустым» строкам и лишним пробелам
+    s = str(date_str).strip()
+    if not s:
+        return None
+
+    # Популярные форматы
+    formats: List[str] = [
+        "%d.%m.%Y",
+        "%Y-%m-%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%d.%m.%y",
+    ]
+    for fmt in formats:
         try:
-            return datetime.strptime(date_str.strip(), fmt)
+            return datetime.strptime(s, fmt)
         except Exception:
             continue
+
+    # Иногда в Google Sheets дата может прийти уже как datetime.date/datetime
+    if isinstance(date_str, datetime):
+        return date_str
+
     return None
 
 
-# --- Параметры расчёта ОСС ---
-SHELF_LIFE_DAYS = 360          # общий срок годности, дней
-TARGET_OSG_PERCENT = 80        # требуемый ОСС на дату отгрузки, %
-SAFETY_BUFFER_DAYS = 2         # небольшой запас
-
-def min_production_date_for_osg(delivery_dt: datetime) -> datetime.date:
+def min_production_date_for_osg(delivery_dt: datetime) -> datetime:
     """
-    Минимальная дата производства, чтобы на дату отгрузки
-    ОСС был >= TARGET_OSG_PERCENT (с учётом буфера).
+    Расчёт «не раньше какого дня можно производить», чтобы к дате доставки
+    ОСС был >= TARGET_OSG_PERCENT.
+
+    Предположим линейное падение ОСС: 100% -> 0% за SHELF_LIFE_DAYS.
+      age_max_days = floor((100 - target)/100 * shelf_life) - buffer
+    Производить не раньше: delivery_dt - age_max_days.
     """
-    max_elapsed = int(SHELF_LIFE_DAYS * (1 - TARGET_OSG_PERCENT / 100))
-    allowed_age = max(0, max_elapsed - SAFETY_BUFFER_DAYS)
-    return (delivery_dt - timedelta(days=allowed_age)).date()
+    # Максимальный допустимый возраст к дате доставки
+    max_age_float = (100 - TARGET_OSG_PERCENT) / 100 * SHELF_LIFE_DAYS
+    max_age_days = max(0, int(max_age_float) - SAFETY_BUFFER_DAYS)
+    return delivery_dt - timedelta(days=max_age_days)
+
+
+def _orders_keyboard() -> InlineKeyboardMarkup:
+    if not ORDERS_CACHE:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("Пусто", callback_data="noop")]])
+    buttons = [[InlineKeyboardButton(order_no, callback_data=order_no)] for order_no in sorted(ORDERS_CACHE)]
+    return InlineKeyboardMarkup(buttons)
+
+
+def _gs_open_worksheet():
+    """Возвращает (sh, ws) — книгу и лист по имени."""
+    # service_account уже возвращает готовый gspread.Client
+    gc = gspread.service_account(filename=GOOGLE_CREDS_PATH)
+
+    sh = gc.open_by_key(GOOGLE_SHEET_ID)
+    ws = sh.worksheet(ORDERS_SHEET_NAME)  # лист по имени
+    return sh, ws
 
 
 
-# -------------------- НАСТРОЙКИ --------------------
-# Можно задать здесь или через переменные окружения:
-#   TELEGRAM_BOT_TOKEN, GOOGLE_SHEET_ID, GOOGLE_APPLICATION_CREDENTIALS
-#   (GOOGLE_APPLICATION_CREDENTIALS — путь к JSON-файлу сервисного аккаунта)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "<В8462456972:AAHBUSVkSYEsJWmexYBoK-gLcTbsdj1LLXoСТАВЬ_СЮДА_ТОКЕН>")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "<1pduByH_gIF9PiLdbFU1IK3yFWJrwGc-maXCumi8r4q8>")
-GOOGLE_CREDS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "gsa.json")
-# Вкладка (лист) по умолчанию. Если такого листа нет, бот возьмет первый.
-SHEET_TITLE = os.getenv("GOOGLE_SHEET_TITLE", "Orders")
 
-# -------------------- ЛОГИ -------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("osg-bot")
+def load_orders_from_sheet() -> Dict[str, str]:
+    """Читает все строки и возвращает {order_no: delivery_str}."""
+    _, ws = _gs_open_worksheet()
 
-# Кэш заказов: {OrderNo: DeliveryDate}
-ORDERS_CACHE: Dict[str, str] = {}
+    values = ws.get_all_values()  # вся таблица как список списков
+    if not values:
+        return {}
 
-
-from gspread.exceptions import WorksheetNotFound, APIError
-
-SHEET_TITLE = "Orders"        # ожидаемое имя листа (вкладки)
-HEADER_ORDER = "OrderNo"
-HEADER_DATE  = "DeliveryDate"
-
-def _connect_sheet():
-    """Подключение к книге по ID. Бросает понятную ошибку при проблеме доступа/ID."""
-    import gspread
-    from google.oauth2.service_account import Credentials
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
-    creds = Credentials.from_service_account_file(GOOGLE_CREDS_PATH, scopes=scopes)
-    client = gspread.authorize(creds)
-
+    # ---- заголовки
+    headers = [h.strip().lower() for h in values[0]]  # убрали пробелы и привели к lower
     try:
-        sh = client.open_by_key(GOOGLE_SHEET_ID)
-    except APIError as e:
-        code = getattr(e.response, "status_code", None)
-        raise RuntimeError(
-            f"Google API: не удалось открыть книгу по ID ({GOOGLE_SHEET_ID}). "
-            f"Статус: {code or 'unknown'}."
-        ) from e
-
-    return client, sh
-
-
-def load_orders_from_sheet() -> dict[str, str]:
-    """
-    Загружает словарь {order_no: delivery_date_str}.
-    Пытается взять лист 'Orders', если нет — берёт первый лист и предупреждает.
-    Бросает RuntimeError с понятным текстом вместо голого [404].
-    """
-    global ORDERS_CACHE
-    client, sh = _connect_sheet()
-
-    # пробуем целевой лист
-    try:
-        ws = sh.worksheet(SHEET_TITLE)
-        used_sheet = SHEET_TITLE
-    except WorksheetNotFound:
-        # fallback — первый лист
-        ws = sh.get_worksheet(0)
-        used_sheet = ws.title
-
-    try:
-        rows = ws.get_all_records()
-    except APIError as e:
-        code = getattr(e.response, "status_code", None)
-        raise RuntimeError(
-            f"Google API: не удалось прочитать лист '{used_sheet}'. Статус: {code or 'unknown'}."
-        ) from e
-
-    if not rows:
-        raise RuntimeError(
-            f"Лист '{used_sheet}' пустой или нет заголовков '{HEADER_ORDER}'/'{HEADER_DATE}'."
+        idx_order = headers.index("orderno")
+        idx_date  = headers.index("deliverydate")
+    except ValueError:
+        raise KeyError(
+            f"В первой строке должны быть колонки 'OrderNo' и 'DeliveryDate'. Сейчас: {headers}"
         )
 
-    data: dict[str, str] = {}
-    for r in rows:
-        order_no = str(r.get(HEADER_ORDER, "")).strip()
-        delivery  = str(r.get(HEADER_DATE, "")).strip()
+    # ---- данные
+    orders: Dict[str, str] = {}
+    for row in values[1:]:
+        # защита от коротких строк
+        if len(row) <= max(idx_order, idx_date):
+            continue
+        order_no = (row[idx_order] or "").strip()
+        delivery = (row[idx_date]  or "").strip()
         if not order_no:
             continue
+        orders[order_no] = delivery or "—"
 
-        # приводим дату к человекочитаемой, если возможно
-        dt = parse_date(delivery)
-        data[order_no] = dt.strftime("%d.%m.%Y") if dt else delivery
+    return orders
 
-    ORDERS_CACHE = data
-    return ORDERS_CACHE, used_sheet
-
-# -------------------- Хэндлеры ---------------------
+# -------------------- ОБРАБОТЧИКИ -------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "Бот расчёта дат производства и проверки заказов из Google Sheets.\n\n"
+        "Бот расчёта дат производства под ОСС.\n\n"
         "Команды:\n"
-        "• /reload — перечитать таблицу и обновить кэш\n"
-        "• /orders — показать кнопки с заказами\n"
-        "• /debug — диагностика подключения к таблице\n\n"
-        "Требуется лист с названием «Orders» (или будет выбран первый лист),\n"
-        "в первой строке заголовки: OrderNo, DeliveryDate."
+        "/reload — перечитать книгу и обновить кэш заказов\n"
+        "/orders — показать кнопки с номерами заказов\n"
+        "/debug — диагностика связи с Google Sheets\n\n"
+        "Правило: считаем минимальную дату розлива так, чтобы к дате доставки\n"
+        f"ОСС был ≥ {TARGET_OSG_PERCENT}%, при сроке годности {SHELF_LIFE_DAYS} дней\n"
+        f"и буфере {SAFETY_BUFFER_DAYS} дн."
     )
     await update.message.reply_text(text)
 
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает, к какой книге/листу подключились и какие заголовки видим."""
+    """Проверка подключения к Google Sheets."""
     try:
-        if not os.path.exists(GOOGLE_CREDS_PATH):
-            await update.message.reply_text(
-                f"❌ Креды не найдены: {GOOGLE_CREDS_PATH}"
-            )
-            return
-
-        client = gspread.service_account(filename=GOOGLE_CREDS_PATH)
-        sh = client.open_by_key(GOOGLE_SHEET_ID)
-        titles = [ws.title for ws in sh.worksheets()]
-        try:
-            ws = sh.worksheet(SHEET_TITLE.strip())
-        except WorksheetNotFound:
-            ws = sh.sheet1
-
-        header = [c.strip() for c in ws.row_values(1)]
-
+        sh, ws = _gs_open_worksheet()
+        first_row = ws.row_values(1)
+        worksheets = [w.title for w in sh.worksheets()]
         msg = (
             "✅ Подключение к Google Sheets — OK\n"
             f"Книга: {sh.title}\n"
-            f"Листы: {', '.join(titles)}\n"
+            f"Листы: {', '.join(worksheets)}\n"
             f"Использую лист: {ws.title}\n"
-            f"Заголовки первой строки: {header}"
+            f"Заголовки первой строки: {first_row}"
         )
         await update.message.reply_text(msg)
     except Exception as e:
-        logger.exception("Ошибка /debug")
-        await update.message.reply_text(f"❌ Ошибка Google Sheets: {e}")
+        logger.exception("DEBUG error")
+        await update.message.reply_text(f"⚠️ Ошибка при доступе к Google Sheets: {e}")
 
 
 async def reload_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Перечитать таблицу, собрать кэш."""
     try:
-        (cache, used_sheet) = load_orders_from_sheet()
-        n = len(cache)
-        extra = "" if used_sheet == SHEET_TITLE else f"\n⚠️ Лист '{SHEET_TITLE}' не найден. Использован лист: '{used_sheet}'."
-        await update.message.reply_text(f"✅ Загружено {n} заказов из Google Sheets.{extra}")
-    except RuntimeError as e:
-        await update.message.reply_text(f"⚠️ Ошибка при загрузке: {e}")
+        global ORDERS_CACHE
+        ORDERS_CACHE = load_orders_from_sheet()
+        await update.message.reply_text(f"✅ Загружено {len(ORDERS_CACHE)} заказов из Google Sheets.")
     except Exception as e:
-        # на всякий случай ловим всё остальное
-        await update.message.reply_text(f"⚠️ Непредвиденная ошибка: {e}")
-
-
-
-def _orders_keyboard() -> InlineKeyboardMarkup:
-    """Строит клавиатуру с кнопками заказов из кэша."""
-    if not ORDERS_CACHE:
-        return InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Пусто", callback_data="noop")]]
-        )
-
-    buttons: List[List[InlineKeyboardButton]] = []
-    for order_no in sorted(ORDERS_CACHE.keys()):
-        buttons.append([InlineKeyboardButton(order_no, callback_data=order_no)])
-
-    return InlineKeyboardMarkup(buttons)
+        logger.exception("Ошибка при загрузке данных")
+        await update.message.reply_text(f"⚠️ Ошибка при загрузке данных: {e}")
 
 
 async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать кнопки с номерами заказов."""
+    """Показать кнопки с заказами."""
     if not ORDERS_CACHE:
-        await update.message.reply_text("Кэш пуст. Сначала выполните /reload.")
+        await update.message.reply_text("Кэш пуст. Сначала выполните /reload")
         return
     await update.message.reply_text("Выбери заказ:", reply_markup=_orders_keyboard())
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатия на номер заказа."""
     query = update.callback_query
     await query.answer()
 
     order_no = query.data
     if order_no == "noop":
-        await query.edit_message_text("Кэш пуст. Сначала выполните /reload")
         return
 
-    # 1) Берём строковую дату из кэша
-    delivery_str = ORDERS_CACHE.get(order_no)
-    if not delivery_str:
-        await query.edit_message_text(f"📦 Заказ: {order_no}\n⚠️ Дата доставки не найдена")
-        return
-
-    # 2) Пробуем распарсить в datetime (поддержим 2 популярных формата)
-    delivery_dt = None
-    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
-        try:
-            delivery_dt = datetime.strptime(delivery_str, fmt)
-            break
-        except ValueError:
-            pass
-
+    delivery_str = ORDERS_CACHE.get(order_no, "")
+    delivery_dt = parse_date(delivery_str)
     if delivery_dt is None:
         await query.edit_message_text(
             f"📦 Заказ: {order_no}\n⚠️ Не удалось распознать дату доставки: {delivery_str}"
         )
         return
 
-    # 3) Считаем минимальную дату розлива под требуемый ОСС
-delivery_dt = parse_date(delivery_str)
+    # расчёт минимальной даты производства
+    min_prod = min_production_date_for_osg(delivery_dt)
 
-if delivery_dt is None:
-    await query.edit_message_text(
-        f"📦 Заказ: {order_no}\n⚠️ Не удалось распознать дату доставки: {delivery_str}"
+    reply = (
+        f"📦 Заказ: {order_no}\n"
+        f"📅 Дата доставки: {delivery_dt.strftime('%d.%m.%Y')}\n"
+        f"💧 Требуемый ОСС: ≥ {TARGET_OSG_PERCENT}%\n"
+        f"🏭 Производство — не раньше: {min_prod.strftime('%d.%m.%Y')}\n"
+        f"📊 Параметры: СГ={SHELF_LIFE_DAYS} дней, буфер={SAFETY_BUFFER_DAYS} дн."
     )
-    return
-
-min_prod = min_production_date_for_osg(delivery_dt)
-
-# 4) Отвечаем
-reply = (
-    f"📦 Заказ: {order_no}\n"
-    f"📅 Дата доставки: {delivery_dt.strftime('%d.%m.%Y')}\n"
-    f"💧 Требуемый ОСС: ≥ {TARGET_OSG_PERCENT}%\n"
-    f"🏭 Производство — не раньше: {min_prod.strftime('%d.%m.%Y')}\n"
-    f"📊 Параметры: СГ={SHELF_LIFE_DAYS} дней, буфер={SAFETY_BUFFER_DAYS} дн."
-)
-await query.edit_message_text(reply)
-
-
-
+    await query.edit_message_text(reply)
 
 # --- очистка webhook перед стартом, чтобы не было конфликта getUpdates ---
 async def _clear_webhook(app: Application):
-    await app.bot.delete_webhook(drop_pending_updates=True)
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook очищен (drop_pending_updates=True).")
+    except Exception:
+        logger.exception("Не удалось очистить webhook")
 
-
-# -------------------- main -------------------------
+# -------------------- main --------------------------
 def main():
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN.startswith("<"):
-        logger.error("TELEGRAM_BOT_TOKEN не задан. Установите значение в коде или через переменную окружения.")
-        return
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN не задан. Проверь ENV/настройки.")
 
     app = (
         Application.builder()
@@ -320,4 +270,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        # Можно включить детальный лог PTB при необходимости:
+        # os.environ["PTB_LOG_LEVEL"] = "DEBUG"
+        main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        raise
