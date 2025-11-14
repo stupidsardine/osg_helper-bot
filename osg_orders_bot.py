@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-OSG Orders Bot — PTB v21+
+OSG Orders Bot — работа по контрагентам
 Google Sheets (gspread + сервисный аккаунт)
 
-Минимальная структура листа (ORDERS_SHEET_NAME):
-- OrderNo        — номер заказа
-- DeliveryDate   — дата доставки (dd.mm.yyyy, yyyy-mm-dd, dd/mm/yyyy, dd.mm.yy)
+Структура листа (ORDERS_SHEET_NAME):
+- Contractor    — контрагент
+- DeliveryDate  — дата доставки (dd.mm.yyyy, yyyy-mm-dd, dd/mm/yyyy, dd.mm.yy)
 
 Логика:
-— считаем минимальную дату розлива так, чтобы к дате доставки OSG сохранился ≥ TARGET_OSG_PERCENT,
-  используя срок годности SHELF_LIFE_DAYS и буфер SAFETY_BUFFER_DAYS.
-— OSG из таблицы НЕ используем, только фиксированные параметры.
-— Кнопки под строкой ввода: Обновить / Заказы / Диагностика (статичные).
-— Любой другой текст бот не принимает и просит пользоваться кнопками.
+— Ты выбираешь контрагента из списка.
+— Бот берёт его дату доставки и считает минимальную дату производства
+  так, чтобы к доставке OSG был ≥ TARGET_OSG_PERCENT,
+  с учётом SHELF_LIFE_DAYS и SAFETY_BUFFER_DAYS.
 """
 
 import os
@@ -46,28 +45,34 @@ logger = logging.getLogger("osg-bot")
 logger.setLevel(logging.DEBUG)
 
 # -------------------- НАСТРОЙКИ ----------------------
-# Можно переопределить через переменные окружения,
-# но для удобства подставлены твои значения по умолчанию.
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8462456972:AAHBUSVkSYEsJWmexYBoK-gLcTbsdj1LLXo")
-GOOGLE_SHEET_ID    = os.getenv("GOOGLE_SHEET_ID",    "1O1LQ0y9IC4k4sp6_q5Uq5E8hABVLkh_29txBaygULdA")
-GOOGLE_CREDS_PATH  = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", r"C:\Users\Алексей\Desktop\osg-helper-bot\gsa.json")
-ORDERS_SHEET_NAME  = os.getenv("ORDERS_SHEET_NAME",  "Orders").strip()
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    "8462456972:AAHBUSVkSYEsJWmexYBoK-gLcTbsdj1LLXo",
+)
+GOOGLE_SHEET_ID = os.getenv(
+    "GOOGLE_SHEET_ID",
+    "1O1LQ0y9IC4k4sp6_q5Uq5E8hABVLkh_29txBaygULdA",
+)
+GOOGLE_CREDS_PATH = os.getenv(
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    r"C:\Users\Алексей\Desktop\osg-helper-bot\gsa.json",
+)
+ORDERS_SHEET_NAME = os.getenv("ORDERS_SHEET_NAME", "Orders").strip()
 
 # Параметры расчёта
-SHELF_LIFE_DAYS     = int(os.getenv("SHELF_LIFE_DAYS",     "360"))  # срок годности (дней)
-TARGET_OSG_PERCENT  = int(os.getenv("TARGET_OSG_PERCENT",  "80"))   # целевой OSG (%)
-SAFETY_BUFFER_DAYS  = int(os.getenv("SAFETY_BUFFER_DAYS",  "3"))    # буфер (дней)
+SHELF_LIFE_DAYS = int(os.getenv("SHELF_LIFE_DAYS", "360"))   # срок годности (дней)
+TARGET_OSG_PERCENT = int(os.getenv("TARGET_OSG_PERCENT", "80"))  # целевой OSG (%)
+SAFETY_BUFFER_DAYS = int(os.getenv("SAFETY_BUFFER_DAYS", "3"))   # буфер (дней)
 
-# Кэш заказов: {order_no: "delivery_str"}
-ORDERS_CACHE: Dict[str, str] = {}
+# Кэш данных: { contractor_name: {"delivery": "дата"} }
+CONTRACTORS_CACHE: Dict[str, Dict[str, str]] = {}
 
-# Кнопки под строкой ввода (ReplyKeyboard) — статичные
+# Кнопки под строкой ввода
 REPLY_KB = ReplyKeyboardMarkup(
-    [["Обновить", "Заказы", "Диагностика"]],
+    [["Обновить", "Контрагенты", "Диагностика"]],
     resize_keyboard=True,
     one_time_keyboard=False,
 )
-
 
 # -------------------- УТИЛИТЫ ------------------------
 def parse_date(date_str: str) -> Optional[datetime]:
@@ -117,55 +122,72 @@ def _gs_open_worksheet():
     return sh, ws
 
 
-def load_orders_from_sheet() -> Dict[str, str]:
-    """Читает все строки и возвращает {order_no: delivery_str}."""
+def load_contractors_from_sheet() -> Dict[str, Dict[str, str]]:
+    """
+    Читает таблицу и возвращает словарь:
+    {
+        "ООО Ромашка": {"delivery": "21.11.2025"},
+        "ИП Иванов":   {"delivery": "22.11.2025"},
+    }
+    Если один контрагент встречается несколько раз — берётся последняя строка.
+    """
     _, ws = _gs_open_worksheet()
     values = ws.get_all_values()
     if not values:
         return {}
 
     headers = [h.strip().lower() for h in values[0]]
+
     try:
-        idx_order = headers.index("orderno")
-        idx_date  = headers.index("deliverydate")
+        idx_contractor = headers.index("contractor")
+        idx_date = headers.index("deliverydate")
     except ValueError:
-        raise KeyError("В первой строке должны быть колонки 'OrderNo' и 'DeliveryDate'.")
+        raise KeyError("В первой строке должны быть колонки 'Contractor' и 'DeliveryDate'.")
 
-    orders: Dict[str, str] = {}
+    data: Dict[str, Dict[str, str]] = {}
+
     for row in values[1:]:
-        if len(row) <= max(idx_order, idx_date):
+        if len(row) <= max(idx_contractor, idx_date):
             continue
-        order_no = (row[idx_order] or "").strip()
-        delivery = (row[idx_date]  or "").strip()
-        if not order_no:
+
+        contractor = (row[idx_contractor] or "").strip()
+        delivery = (row[idx_date] or "").strip()
+
+        if not contractor:
             continue
-        orders[order_no] = delivery or "—"
-    return orders
+
+        data[contractor] = {
+            "delivery": delivery or "—"
+        }
+
+    return data
 
 
-def _orders_keyboard() -> InlineKeyboardMarkup:
-    """Инлайн-клавиатура с номерами заказов."""
-    if not ORDERS_CACHE:
+def _contractors_keyboard() -> InlineKeyboardMarkup:
+    """Инлайн-клавиатура с контрагентами."""
+    if not CONTRACTORS_CACHE:
         return InlineKeyboardMarkup([[InlineKeyboardButton("Пусто", callback_data="noop")]])
-    buttons = [[InlineKeyboardButton(order_no, callback_data=order_no)]
-               for order_no in sorted(ORDERS_CACHE)]
+
+    buttons = [
+        [InlineKeyboardButton(name, callback_data=name)]
+        for name in sorted(CONTRACTORS_CACHE)
+    ]
     return InlineKeyboardMarkup(buttons)
 
 
 # -------------------- ОБРАБОТЧИКИ -------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /start — приветствие и показ меню.
-    Вызывается и при клике по ссылке t.me/бот?start=... (кнопка START).
+    /start — приветствие и меню.
     """
     text = (
-        "Бот расчёта дат производства под целевой OSG.\n\n"
+        "Бот расчёта дат производства под OSG по контрагентам.\n\n"
         "Я работаю по кнопкам внизу 👇\n\n"
         "Команды:\n"
-        "/reload — перечитать книгу и обновить кэш\n"
-        "/orders — показать список заказов\n"
-        "/debug  — диагностика Google Sheets\n"
-        "/menu   — показать панель кнопок\n\n"
+        "/reload       — перечитать таблицу и обновить кэш\n"
+        "/contractors  — показать список контрагентов\n"
+        "/debug        — диагностика Google Sheets\n"
+        "/menu         — показать панель кнопок\n\n"
         "Параметры:\n"
         f"• Целевой OSG: ≥ {TARGET_OSG_PERCENT}%\n"
         f"• Срок годности: {SHELF_LIFE_DAYS} дней\n"
@@ -198,13 +220,13 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка при доступе к Google Sheets: {e}", reply_markup=REPLY_KB)
 
 
-async def reload_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Перечитать таблицу, собрать кэш."""
+async def reload_contractors(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Перечитать таблицу, собрать кэш контрагентов."""
     try:
-        global ORDERS_CACHE
-        ORDERS_CACHE = load_orders_from_sheet()
+        global CONTRACTORS_CACHE
+        CONTRACTORS_CACHE = load_contractors_from_sheet()
         await update.message.reply_text(
-            f"✅ Загружено {len(ORDERS_CACHE)} заказов из Google Sheets.",
+            f"✅ Загружено {len(CONTRACTORS_CACHE)} контрагентов из Google Sheets.",
             reply_markup=REPLY_KB
         )
     except Exception as e:
@@ -212,28 +234,31 @@ async def reload_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка при загрузке данных: {e}", reply_markup=REPLY_KB)
 
 
-async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать инлайн-кнопки с заказами."""
-    if not ORDERS_CACHE:
-        await update.message.reply_text("Кэш пуст. Сначала выполните /reload", reply_markup=REPLY_KB)
+async def show_contractors(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать список контрагентов."""
+    if not CONTRACTORS_CACHE:
+        await update.message.reply_text("Кэш пуст. Сначала нажми «Обновить».", reply_markup=REPLY_KB)
         return
-    await update.message.reply_text("Выбери заказ:", reply_markup=_orders_keyboard())
+
+    await update.message.reply_text("Выбери контрагента:", reply_markup=_contractors_keyboard())
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка нажатия на номер заказа (инлайн-кнопка)."""
+    """Обработка нажатия на контрагента (инлайн-кнопка)."""
     query = update.callback_query
     await query.answer()
 
-    order_no = query.data
-    if order_no == "noop":
+    contractor = query.data
+    if contractor == "noop":
         return
 
-    delivery_str = ORDERS_CACHE.get(order_no, "")
+    info = CONTRACTORS_CACHE.get(contractor) or {}
+    delivery_str = info.get("delivery", "")
     delivery_dt = parse_date(delivery_str)
+
     if delivery_dt is None:
         await query.message.reply_text(
-            f"📦 Заказ: {order_no}\n⚠️ Не удалось распознать дату доставки: {delivery_str}",
+            f"🏢 Контрагент: {contractor}\n⚠️ Не удалось распознать дату доставки: {delivery_str}",
             reply_markup=REPLY_KB
         )
         return
@@ -241,36 +266,33 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     min_prod = min_production_date_for_osg(delivery_dt)
 
     reply = (
-        f"📦 Заказ: {order_no}\n"
+        f"🏢 Контрагент: {contractor}\n"
         f"📅 Дата доставки: {delivery_dt.strftime('%d.%m.%Y')}\n"
         f"💧 Требуемый OSG: ≥ {TARGET_OSG_PERCENT}%\n"
         f"🏭 Производство — *не раньше*: {min_prod.strftime('%d.%m.%Y')}\n"
         f"📊 Параметры: СГ={SHELF_LIFE_DAYS} дней, буфер={SAFETY_BUFFER_DAYS} дн."
     )
 
-    # ВАЖНО: отправляем НОВОЕ сообщение, а не редактируем старое.
-    # Так инлайн-клавиатура со списком заказов остаётся на месте,
-    # а снизу остаются статичные Reply-кнопки.
-    await query.message.reply_text(reply, parse_mode="Markdown", reply_markup=REPLY_KB)
+    await query.message.reply_text(reply, reply_markup=REPLY_KB)
 
 
 async def on_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Любой произвольный текст: либо обрабатываем как нажатие на кнопку,
-    либо отвечаем, что бот работает только по кнопкам.
+    Любой текст: либо обрабатываем как одну из кнопок,
+    либо говорим, что бот работает по кнопкам.
     """
     txt = (update.message.text or "").strip()
 
     if txt == "Обновить":
-        await reload_orders(update, context)
-    elif txt == "Заказы":
-        await show_orders(update, context)
+        await reload_contractors(update, context)
+    elif txt == "Контрагенты":
+        await show_contractors(update, context)
     elif txt == "Диагностика":
         await debug(update, context)
     else:
         await update.message.reply_text(
             "Я работаю по кнопкам внизу 👇\n"
-            "Пожалуйста, используй «Обновить», «Заказы» или «Диагностика».",
+            "Пожалуйста, используй «Обновить», «Контрагенты» или «Диагностика».",
             reply_markup=REPLY_KB
         )
 
@@ -301,13 +323,15 @@ def main():
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("debug", debug))
-    app.add_handler(CommandHandler("reload", reload_orders))
-    app.add_handler(CommandHandler("orders", show_orders))
+    app.add_handler(CommandHandler("reload", reload_contractors))
+    app.add_handler(CommandHandler("contractors", show_contractors))
+    # на всякий случай старая команда /orders ведёт туда же
+    app.add_handler(CommandHandler("orders", show_contractors))
 
-    # Любой текст (не команда) → обработка кнопок или сообщение «только по кнопкам»
+    # Любой текст
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_any_text))
 
-    # Инлайн-кнопки с заказами
+    # Инлайн-кнопки
     app.add_handler(CallbackQueryHandler(button_callback))
 
     logger.info("Бот запущен. Ожидаю сообщения…")
