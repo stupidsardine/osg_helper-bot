@@ -1,17 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-OSG Orders Bot — работа по контрагентам
+OSG Orders Bot — работа по контрагентам + логирование пользователей
 Google Sheets (gspread + сервисный аккаунт)
 
-Структура листа (ORDERS_SHEET_NAME):
+Лист Orders:
 - Contractor    — контрагент
-- DeliveryDate  — дата доставки (dd.mm.yyyy, yyyy-mm-dd, dd/mm/yyyy, dd.mm.yy)
+- DeliveryDate  — дата доставки
 
-Логика:
-— Ты выбираешь контрагента из списка.
-— Бот берёт его дату доставки и считает минимальную дату производства
-  так, чтобы к доставке OSG был ≥ TARGET_OSG_PERCENT,
-  с учётом SHELF_LIFE_DAYS и SAFETY_BUFFER_DAYS.
+Лист UserLog (создаётся автоматически):
+- timestamp | user_id | username | name | action | extra
 """
 
 import os
@@ -20,6 +17,7 @@ from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 
 import gspread
+from gspread.exceptions import WorksheetNotFound
 
 from telegram import (
     Update,
@@ -57,12 +55,14 @@ GOOGLE_CREDS_PATH = os.getenv(
     "GOOGLE_APPLICATION_CREDENTIALS",
     r"C:\Users\Алексей\Desktop\osg-helper-bot\gsa.json",
 )
+
 ORDERS_SHEET_NAME = os.getenv("ORDERS_SHEET_NAME", "Orders").strip()
+LOG_SHEET_NAME = os.getenv("LOG_SHEET_NAME", "UserLog").strip()
 
 # Параметры расчёта
-SHELF_LIFE_DAYS = int(os.getenv("SHELF_LIFE_DAYS", "360"))   # срок годности (дней)
-TARGET_OSG_PERCENT = int(os.getenv("TARGET_OSG_PERCENT", "80"))  # целевой OSG (%)
-SAFETY_BUFFER_DAYS = int(os.getenv("SAFETY_BUFFER_DAYS", "3"))   # буфер (дней)
+SHELF_LIFE_DAYS = int(os.getenv("SHELF_LIFE_DAYS", "360"))        # срок годности (дней)
+TARGET_OSG_PERCENT = int(os.getenv("TARGET_OSG_PERCENT", "80"))   # целевой OSG (%)
+SAFETY_BUFFER_DAYS = int(os.getenv("SAFETY_BUFFER_DAYS", "3"))    # буфер (дней)
 
 # Кэш данных: { contractor_name: {"delivery": "дата"} }
 CONTRACTORS_CACHE: Dict[str, Dict[str, str]] = {}
@@ -115,13 +115,61 @@ def min_production_date_for_osg(delivery_dt: datetime) -> datetime:
 
 
 def _gs_open_worksheet():
-    """Возвращает (sh, ws) — книгу и лист по имени."""
+    """Возвращает (sh, ws) — книгу и лист Orders."""
     gc = gspread.service_account(filename=GOOGLE_CREDS_PATH)
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
     ws = sh.worksheet(ORDERS_SHEET_NAME)
     return sh, ws
 
+# ---------- ЛОГИРОВАНИЕ ПОЛЬЗОВАТЕЛЕЙ В ОТДЕЛЬНЫЙ ЛИСТ -----------
+def _get_log_worksheet(sh) -> gspread.Worksheet:
+    """
+    Возвращает лист для логов пользователей.
+    Если его нет — создаёт и записывает заголовки.
+    """
+    try:
+        log_ws = sh.worksheet(LOG_SHEET_NAME)
+    except WorksheetNotFound:
+        log_ws = sh.add_worksheet(title=LOG_SHEET_NAME, rows=1000, cols=6)
+        log_ws.append_row(
+            ["timestamp", "user_id", "username", "name", "action", "extra"],
+            value_input_option="USER_ENTERED",
+        )
+    return log_ws
 
+
+def log_user_action(user, action: str, extra: str = ""):
+    """
+    Пишет действие пользователя в лист UserLog.
+    Не ломает бота, если что-то пошло не так.
+    """
+    try:
+        if user is None:
+            return
+
+        gc = gspread.service_account(filename=GOOGLE_CREDS_PATH)
+        sh = gc.open_by_key(GOOGLE_SHEET_ID)
+        log_ws = _get_log_worksheet(sh)
+
+        ts = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+        user_id = user.id
+        username = user.username or ""
+        name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+
+        log_ws.append_row(
+            [ts, user_id, username, name, action, extra],
+            value_input_option="USER_ENTERED",
+        )
+
+        logger.debug(
+            "Logged user action: %s %s (%s) — %s / %s",
+            user_id, username, name, action, extra
+        )
+    except Exception:
+        logger.exception("Failed to log user action")
+
+
+# -------------------- РАБОТА С ТАБЛИЦЕЙ ЗАКАЗОВ -------------------
 def load_contractors_from_sheet() -> Dict[str, Dict[str, str]]:
     """
     Читает таблицу и возвращает словарь:
@@ -177,9 +225,10 @@ def _contractors_keyboard() -> InlineKeyboardMarkup:
 
 # -------------------- ОБРАБОТЧИКИ -------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /start — приветствие и меню.
-    """
+    """ /start — приветствие и меню. """
+    user = update.effective_user
+    log_user_action(user, "start")
+
     text = (
         "Бот расчёта дат производства под OSG по контрагентам.\n\n"
         "Я работаю по кнопкам внизу 👇\n\n"
@@ -197,12 +246,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручной вызов панели кнопок."""
+    user = update.effective_user
+    log_user_action(user, "menu")
     await update.message.reply_text("Меню:", reply_markup=REPLY_KB)
 
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Проверка подключения к Google Sheets."""
+    user = update.effective_user
+    log_user_action(user, "debug")
+
     try:
         sh, ws = _gs_open_worksheet()
         first_row = ws.row_values(1)
@@ -222,6 +275,9 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reload_contractors(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Перечитать таблицу, собрать кэш контрагентов."""
+    user = update.effective_user
+    log_user_action(user, "reload_contractors")
+
     try:
         global CONTRACTORS_CACHE
         CONTRACTORS_CACHE = load_contractors_from_sheet()
@@ -236,6 +292,9 @@ async def reload_contractors(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def show_contractors(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать список контрагентов."""
+    user = update.effective_user
+    log_user_action(user, "show_contractors")
+
     if not CONTRACTORS_CACHE:
         await update.message.reply_text("Кэш пуст. Сначала нажми «Обновить».", reply_markup=REPLY_KB)
         return
@@ -251,6 +310,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     contractor = query.data
     if contractor == "noop":
         return
+
+    user = query.from_user
+    log_user_action(user, "select_contractor", extra=contractor)
 
     info = CONTRACTORS_CACHE.get(contractor) or {}
     delivery_str = info.get("delivery", "")
@@ -281,6 +343,7 @@ async def on_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Любой текст: либо обрабатываем как одну из кнопок,
     либо говорим, что бот работает по кнопкам.
     """
+    user = update.effective_user
     txt = (update.message.text or "").strip()
 
     if txt == "Обновить":
@@ -290,6 +353,7 @@ async def on_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif txt == "Диагностика":
         await debug(update, context)
     else:
+        log_user_action(user, "unknown_text", extra=txt)
         await update.message.reply_text(
             "Я работаю по кнопкам внизу 👇\n"
             "Пожалуйста, используй «Обновить», «Контрагенты» или «Диагностика».",
