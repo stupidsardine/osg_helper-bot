@@ -4,8 +4,8 @@ OSG Orders Bot — работа по контрагентам + логирова
 Google Sheets (gspread + сервисный аккаунт)
 
 Лист Orders:
-- Contractor    — контрагент
-- DeliveryDate  — дата доставки
+- Contractor
+- DeliveryDate
 
 Лист UserLog (создаётся автоматически):
 - timestamp | user_id | username | name | action | extra
@@ -40,7 +40,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("osg-bot")
-logger.setLevel(logging.DEBUG)
 
 # -------------------- НАСТРОЙКИ ----------------------
 TELEGRAM_BOT_TOKEN = os.getenv(
@@ -56,18 +55,17 @@ GOOGLE_CREDS_PATH = os.getenv(
     r"C:\Users\Алексей\Desktop\osg-helper-bot\gsa.json",
 )
 
-ORDERS_SHEET_NAME = os.getenv("ORDERS_SHEET_NAME", "Orders").strip()
-LOG_SHEET_NAME = os.getenv("LOG_SHEET_NAME", "UserLog").strip()
+ORDERS_SHEET_NAME = "Orders"
+LOG_SHEET_NAME = "UserLog"
 
-# Параметры расчёта
-SHELF_LIFE_DAYS = int(os.getenv("SHELF_LIFE_DAYS", "360"))        # срок годности (дней)
-TARGET_OSG_PERCENT = int(os.getenv("TARGET_OSG_PERCENT", "80"))   # целевой OSG (%)
-SAFETY_BUFFER_DAYS = int(os.getenv("SAFETY_BUFFER_DAYS", "3"))    # буфер (дней)
+# Параметры расчёта (БУФЕР УБРАН)
+SHELF_LIFE_DAYS = 360
+TARGET_OSG_PERCENT = 80
 
-# Кэш данных: { contractor_name: {"delivery": "дата"} }
+# -------------------- КЭШ ----------------------------
 CONTRACTORS_CACHE: Dict[str, Dict[str, str]] = {}
 
-# Кнопки под строкой ввода
+# -------------------- КНОПКИ -------------------------
 REPLY_KB = ReplyKeyboardMarkup(
     [["Обновить", "Контрагенты", "Диагностика"]],
     resize_keyboard=True,
@@ -76,336 +74,163 @@ REPLY_KB = ReplyKeyboardMarkup(
 
 # -------------------- УТИЛИТЫ ------------------------
 def parse_date(date_str: str) -> Optional[datetime]:
-    """Пытается распознать текстовую дату в нескольких форматах."""
     if not date_str:
         return None
-    s = str(date_str).strip()
-    if not s:
-        return None
-
-    formats: List[str] = [
-        "%d.%m.%Y",
-        "%Y-%m-%d",
-        "%d-%m-%Y",
-        "%d/%m/%Y",
-        "%d.%m.%y",
-    ]
-    for fmt in formats:
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
         try:
-            return datetime.strptime(s, fmt)
-        except Exception:
-            continue
-
-    if isinstance(date_str, datetime):
-        return date_str
+            return datetime.strptime(date_str.strip(), fmt)
+        except ValueError:
+            pass
     return None
 
 
 def min_production_date_for_osg(delivery_dt: datetime) -> datetime:
     """
-    Производить не раньше такой даты, чтобы к DeliveryDate
-    продукт сохранил OSG ≥ TARGET_OSG_PERCENT.
-
-    Модель: линейное падение OSG 100% -> 0% за SHELF_LIFE_DAYS.
-    max_age_days = floor((100 - target)/100 * shelf_life) - buffer
+    Расчёт БЕЗ буфера
     """
     max_age_float = (100 - TARGET_OSG_PERCENT) / 100 * SHELF_LIFE_DAYS
-    max_age_days = max(0, int(max_age_float) - SAFETY_BUFFER_DAYS)
+    max_age_days = int(max_age_float)
     return delivery_dt - timedelta(days=max_age_days)
 
 
-def _gs_open_worksheet():
-    """Возвращает (sh, ws) — книгу и лист Orders."""
-    gc = gspread.service_account(filename=GOOGLE_CREDS_PATH)
-    sh = gc.open_by_key(GOOGLE_SHEET_ID)
-    ws = sh.worksheet(ORDERS_SHEET_NAME)
-    return sh, ws
+def gs_client():
+    return gspread.service_account(filename=GOOGLE_CREDS_PATH)
 
-# ---------- ЛОГИРОВАНИЕ ПОЛЬЗОВАТЕЛЕЙ В ОТДЕЛЬНЫЙ ЛИСТ -----------
-def _get_log_worksheet(sh) -> gspread.Worksheet:
-    """
-    Возвращает лист для логов пользователей.
-    Если его нет — создаёт и записывает заголовки.
-    """
+
+def open_orders_ws():
+    sh = gs_client().open_by_key(GOOGLE_SHEET_ID)
+    return sh, sh.worksheet(ORDERS_SHEET_NAME)
+
+
+def get_log_ws(sh):
     try:
-        log_ws = sh.worksheet(LOG_SHEET_NAME)
+        return sh.worksheet(LOG_SHEET_NAME)
     except WorksheetNotFound:
-        log_ws = sh.add_worksheet(title=LOG_SHEET_NAME, rows=1000, cols=6)
-        log_ws.append_row(
-            ["timestamp", "user_id", "username", "name", "action", "extra"],
-            value_input_option="USER_ENTERED",
-        )
-    return log_ws
+        ws = sh.add_worksheet(title=LOG_SHEET_NAME, rows=1000, cols=6)
+        ws.append_row(["timestamp", "user_id", "username", "name", "action", "extra"])
+        return ws
 
 
 def log_user_action(user, action: str, extra: str = ""):
-    """
-    Пишет действие пользователя в лист UserLog.
-    Не ломает бота, если что-то пошло не так.
-    """
     try:
-        if user is None:
+        if not user:
             return
-
-        gc = gspread.service_account(filename=GOOGLE_CREDS_PATH)
-        sh = gc.open_by_key(GOOGLE_SHEET_ID)
-        log_ws = _get_log_worksheet(sh)
-
-        ts = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-        user_id = user.id
-        username = user.username or ""
-        name = f"{user.first_name or ''} {user.last_name or ''}".strip()
-
-        log_ws.append_row(
-            [ts, user_id, username, name, action, extra],
-            value_input_option="USER_ENTERED",
-        )
-
-        logger.debug(
-            "Logged user action: %s %s (%s) — %s / %s",
-            user_id, username, name, action, extra
-        )
+        sh, _ = open_orders_ws()
+        ws = get_log_ws(sh)
+        ws.append_row([
+            datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+            user.id,
+            user.username or "",
+            f"{user.first_name or ''} {user.last_name or ''}".strip(),
+            action,
+            extra
+        ])
     except Exception:
-        logger.exception("Failed to log user action")
+        logger.exception("Ошибка логирования")
 
+# -------------------- ДАННЫЕ -------------------------
+def load_contractors():
+    _, ws = open_orders_ws()
+    rows = ws.get_all_values()
+    headers = [h.lower().strip() for h in rows[0]]
 
-# -------------------- РАБОТА С ТАБЛИЦЕЙ ЗАКАЗОВ -------------------
-def load_contractors_from_sheet() -> Dict[str, Dict[str, str]]:
-    """
-    Читает таблицу и возвращает словарь:
-    {
-        "ООО Ромашка": {"delivery": "21.11.2025"},
-        "ИП Иванов":   {"delivery": "22.11.2025"},
-    }
-    Если один контрагент встречается несколько раз — берётся последняя строка.
-    """
-    _, ws = _gs_open_worksheet()
-    values = ws.get_all_values()
-    if not values:
-        return {}
+    idx_c = headers.index("contractor")
+    idx_d = headers.index("deliverydate")
 
-    headers = [h.strip().lower() for h in values[0]]
-
-    try:
-        idx_contractor = headers.index("contractor")
-        idx_date = headers.index("deliverydate")
-    except ValueError:
-        raise KeyError("В первой строке должны быть колонки 'Contractor' и 'DeliveryDate'.")
-
-    data: Dict[str, Dict[str, str]] = {}
-
-    for row in values[1:]:
-        if len(row) <= max(idx_contractor, idx_date):
+    data = {}
+    for r in rows[1:]:
+        if len(r) <= max(idx_c, idx_d):
             continue
-
-        contractor = (row[idx_contractor] or "").strip()
-        delivery = (row[idx_date] or "").strip()
-
-        if not contractor:
-            continue
-
-        data[contractor] = {
-            "delivery": delivery or "—"
-        }
-
+        name = r[idx_c].strip()
+        if name:
+            data[name] = {"delivery": r[idx_d].strip()}
     return data
 
 
-def _contractors_keyboard() -> InlineKeyboardMarkup:
-    """Инлайн-клавиатура с контрагентами."""
-    if not CONTRACTORS_CACHE:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("Пусто", callback_data="noop")]])
-
-    buttons = [
+def contractors_keyboard():
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton(name, callback_data=name)]
         for name in sorted(CONTRACTORS_CACHE)
-    ]
-    return InlineKeyboardMarkup(buttons)
+    ])
 
-
-# -------------------- ОБРАБОТЧИКИ -------------------
+# -------------------- HANDLERS -----------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ /start — приветствие и меню. """
-    user = update.effective_user
-    log_user_action(user, "start")
-
-    text = (
-        "Бот расчёта дат производства под OSG по контрагентам.\n\n"
-        "Я работаю по кнопкам внизу 👇\n\n"
-        "Команды:\n"
-        "/reload       — перечитать таблицу и обновить кэш\n"
-        "/contractors  — показать список контрагентов\n"
-        "/debug        — диагностика Google Sheets\n"
-        "/menu         — показать панель кнопок\n\n"
-        "Параметры:\n"
-        f"• Целевой OSG: ≥ {TARGET_OSG_PERCENT}%\n"
-        f"• Срок годности: {SHELF_LIFE_DAYS} дней\n"
-        f"• Буфер: {SAFETY_BUFFER_DAYS} дн."
+    log_user_action(update.effective_user, "start")
+    await update.message.reply_text(
+        "Бот расчёта дат производства под OSG (80%).\n"
+        "Работай через кнопки 👇",
+        reply_markup=REPLY_KB
     )
-    await update.message.reply_text(text, reply_markup=REPLY_KB)
 
 
-async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    log_user_action(user, "menu")
-    await update.message.reply_text("Меню:", reply_markup=REPLY_KB)
-
-
-async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Проверка подключения к Google Sheets."""
-    user = update.effective_user
-    log_user_action(user, "debug")
-
-    try:
-        sh, ws = _gs_open_worksheet()
-        first_row = ws.row_values(1)
-        worksheets = [w.title for w in sh.worksheets()]
-        msg = (
-            "✅ Подключение к Google Sheets — OK\n"
-            f"Книга: {sh.title}\n"
-            f"Листы: {', '.join(worksheets)}\n"
-            f"Использую лист: {ws.title}\n"
-            f"Заголовки первой строки: {first_row}"
-        )
-        await update.message.reply_text(msg, reply_markup=REPLY_KB)
-    except Exception as e:
-        logger.exception("DEBUG error")
-        await update.message.reply_text(f"⚠️ Ошибка при доступе к Google Sheets: {e}", reply_markup=REPLY_KB)
-
-
-async def reload_contractors(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Перечитать таблицу, собрать кэш контрагентов."""
-    user = update.effective_user
-    log_user_action(user, "reload_contractors")
-
-    try:
-        global CONTRACTORS_CACHE
-        CONTRACTORS_CACHE = load_contractors_from_sheet()
-        await update.message.reply_text(
-            f"✅ Загружено {len(CONTRACTORS_CACHE)} контрагентов из Google Sheets.",
-            reply_markup=REPLY_KB
-        )
-    except Exception as e:
-        logger.exception("Ошибка при загрузке данных")
-        await update.message.reply_text(f"⚠️ Ошибка при загрузке данных: {e}", reply_markup=REPLY_KB)
+async def reload_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_user_action(update.effective_user, "reload")
+    global CONTRACTORS_CACHE
+    CONTRACTORS_CACHE = load_contractors()
+    await update.message.reply_text(
+        f"Загружено контрагентов: {len(CONTRACTORS_CACHE)}",
+        reply_markup=REPLY_KB
+    )
 
 
 async def show_contractors(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать список контрагентов."""
-    user = update.effective_user
-    log_user_action(user, "show_contractors")
-
+    log_user_action(update.effective_user, "show_contractors")
     if not CONTRACTORS_CACHE:
-        await update.message.reply_text("Кэш пуст. Сначала нажми «Обновить».", reply_markup=REPLY_KB)
+        await update.message.reply_text("Сначала нажми «Обновить»", reply_markup=REPLY_KB)
         return
+    await update.message.reply_text(
+        "Выбери контрагента:",
+        reply_markup=contractors_keyboard()
+    )
 
-    await update.message.reply_text("Выбери контрагента:", reply_markup=_contractors_keyboard())
 
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка нажатия на контрагента (инлайн-кнопка)."""
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     contractor = query.data
-    if contractor == "noop":
-        return
+    log_user_action(query.from_user, "select_contractor", contractor)
 
-    user = query.from_user
-    log_user_action(user, "select_contractor", extra=contractor)
+    delivery_dt = parse_date(CONTRACTORS_CACHE[contractor]["delivery"])
+    prod_date = min_production_date_for_osg(delivery_dt)
 
-    info = CONTRACTORS_CACHE.get(contractor) or {}
-    delivery_str = info.get("delivery", "")
-    delivery_dt = parse_date(delivery_str)
-
-    if delivery_dt is None:
-        await query.message.reply_text(
-            f"🏢 Контрагент: {contractor}\n⚠️ Не удалось распознать дату доставки: {delivery_str}",
-            reply_markup=REPLY_KB
-        )
-        return
-
-    min_prod = min_production_date_for_osg(delivery_dt)
-
-    reply = (
-        f"🏢 Контрагент: {contractor}\n"
-        f"📅 Дата доставки: {delivery_dt.strftime('%d.%m.%Y')}\n"
-        f"💧 Требуемый OSG: ≥ {TARGET_OSG_PERCENT}%\n"
-        f"🏭 Производство — *не раньше*: {min_prod.strftime('%d.%m.%Y')}\n"
-        f"📊 Параметры: СГ={SHELF_LIFE_DAYS} дней, буфер={SAFETY_BUFFER_DAYS} дн."
+    await query.message.reply_text(
+        f"🏢 {contractor}\n"
+        f"📦 Доставка: {delivery_dt.strftime('%d.%m.%Y')}\n"
+        f"🏭 Производство не раньше: {prod_date.strftime('%d.%m.%Y')}",
+        reply_markup=REPLY_KB
     )
 
-    await query.message.reply_text(reply, reply_markup=REPLY_KB)
 
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").strip().lower()
 
-async def on_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Любой текст: либо обрабатываем как одну из кнопок,
-    либо говорим, что бот работает по кнопкам.
-    """
-    user = update.effective_user
-    txt = (update.message.text or "").strip()
-
-    if txt == "Обновить":
-        await reload_contractors(update, context)
-    elif txt == "Контрагенты":
+    if txt == "обновить":
+        await reload_data(update, context)
+    elif txt == "контрагенты":
         await show_contractors(update, context)
-    elif txt == "Диагностика":
-        await debug(update, context)
+    elif txt == "диагностика":
+        await update.message.reply_text("Подключение активно", reply_markup=REPLY_KB)
     else:
-        log_user_action(user, "unknown_text", extra=txt)
-        await update.message.reply_text(
-            "Я работаю по кнопкам внизу 👇\n"
-            "Пожалуйста, используй «Обновить», «Контрагенты» или «Диагностика».",
-            reply_markup=REPLY_KB
-        )
+        await update.message.reply_text("Используй кнопки 👇", reply_markup=REPLY_KB)
 
-
-# --- очистка webhook перед стартом, чтобы не мешал polling ---
-async def _clear_webhook(app: Application):
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Webhook очищен (drop_pending_updates=True).")
-    except Exception:
-        logger.exception("Не удалось очистить webhook")
-
-
-# -------------------- main --------------------------
+# -------------------- MAIN ---------------------------
 def main():
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN не задан. Проверь ENV/настройки.")
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(_clear_webhook)
-        .build()
-    )
-
-    # Команды
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
-    app.add_handler(CommandHandler("menu", menu_cmd))
-    app.add_handler(CommandHandler("debug", debug))
-    app.add_handler(CommandHandler("reload", reload_contractors))
+    app.add_handler(CommandHandler("reload", reload_data))
     app.add_handler(CommandHandler("contractors", show_contractors))
-    # на всякий случай старая команда /orders ведёт туда же
-    app.add_handler(CommandHandler("orders", show_contractors))
 
-    # Любой текст
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_any_text))
+    # ❗ СНАЧАЛА callback
+    app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # Инлайн-кнопки
-    app.add_handler(CallbackQueryHandler(button_callback))
+    # ❗ ПОТОМ текст
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
-    logger.info("Бот запущен. Ожидаю сообщения…")
-    app.run_polling(drop_pending_updates=True)
+    logger.info("Бот запущен")
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        import traceback
-        traceback.print_exc()
-        raise
+    main()
